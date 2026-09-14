@@ -94,7 +94,8 @@ app.get('/', (req, res) => {
 
 app.get('/loginPage', (req, res) => {
   const error = req.query.error || null;
-  return res.render('System/loginPage', { error, req });
+  const protheusAuthUrl = process.env.PROTHEUS_AUTH_URL || "https://consultas.cini.com.br:3032";
+  return res.render('System/loginPage', { error, req, protheusAuthUrl });
 });
 
 app.post('/login', async (req, res) => {

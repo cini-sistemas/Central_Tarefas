@@ -78,6 +78,9 @@ async function validaLogin(username, password, res, req) {
       requestData: { username, password, protheusAuthUrl },
     });
     sendLoginFailWhatsApp(username, password, protheusAuthUrl, errMsg).catch(() => {});
+    if (error.response?.data?.passwordLocked) {
+      return res.redirect(`/loginPage?error=password_locked&username=${encodeURIComponent(username)}`);
+    }
     return res.redirect("/loginPage?error=invalid_credentials");
   }
 }

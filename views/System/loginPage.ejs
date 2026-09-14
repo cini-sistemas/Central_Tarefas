@@ -37,6 +37,20 @@
                 </div>
               </div>
             <% } %>
+            <% if (typeof error !== 'undefined' && error === 'password_locked') { %>
+              <div class="alert alert-warning mt-2" role="alert" style="border-left: 4px solid #ffc107;">
+                <div class="d-flex align-items-center mb-2">
+                  <i class="fas fa-lock me-2" style="font-size: 1.2em;"></i>
+                  <div>
+                    <strong>Senha bloqueada por inatividade!</strong><br>
+                    <small>Sua senha do Protheus foi bloqueada por ficar muito tempo sem acesso.</small>
+                  </div>
+                </div>
+                <a class="btn btn-warning btn-sm w-100" href="<%= protheusAuthUrl %>/reset-senha.html?username=<%= encodeURIComponent(req.query.username || '') %>">
+                  Redefinir senha
+                </a>
+              </div>
+            <% } %>
           </div>
           <div class="card-body">
             <form id="loginForm">
