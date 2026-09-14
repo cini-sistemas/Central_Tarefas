@@ -77,6 +77,9 @@
                   <span id="btnText">Entrar</span>
                 </button>
               </div>
+              <div class="text-center mt-3">
+                <a href="#" id="forgotPasswordLink" class="text-muted" style="font-size: 0.875rem; text-decoration: none;">Esqueci minha senha?</a>
+              </div>
             </form>
           </div>
         </div>
@@ -89,6 +92,7 @@
     #togglePassword:focus { background: none !important; color: #6c757d !important; border: none !important; box-shadow: none !important; outline: none !important; }
     #togglePassword:active { background: none !important; color: #6c757d !important; border: none !important; box-shadow: none !important; }
     .alert-warning { box-shadow: 0 4px 8px rgba(255, 193, 7, 0.3); }
+    #forgotPasswordLink:hover { text-decoration: underline !important; color: #495057 !important; }
   </style>
   <script>
     document.addEventListener('DOMContentLoaded', function() {
@@ -113,6 +117,14 @@
         if (h6Element) h6Element.parentNode.insertBefore(timeoutMessage, h6Element.nextSibling);
         document.getElementById('username').focus();
       }
+    });
+
+    document.getElementById('forgotPasswordLink').addEventListener('click', function(e) {
+      e.preventDefault();
+      var username = (document.getElementById('username') || {}).value || '';
+      var url = '<%= protheusAuthUrl %>/reset-senha.html?username=' + encodeURIComponent(username.trim())
+        + '&returnUrl=' + encodeURIComponent(window.location.origin + window.location.pathname);
+      window.location.href = url;
     });
 
     document.getElementById('togglePassword').addEventListener('click', function() {
