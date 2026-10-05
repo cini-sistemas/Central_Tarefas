@@ -1,28 +1,12 @@
 'use strict';
 
-const sql      = require('mssql');
-const dbConfig = require('../config/dbConfig');
-
-let _pool = null;
-let _poolPromise = null;
-
-async function getPool() {
-  if (_pool && _pool.connected) return _pool;
-  if (!_poolPromise) {
-    _poolPromise = (async () => {
-      try {
-        const pool = new sql.ConnectionPool(dbConfig);
-        _pool = await pool.connect();
-        _pool.on('error', () => { _pool = null; _poolPromise = null; });
-        return _pool;
-      } catch (err) {
-        _poolPromise = null;
-        throw err;
-      }
-    })();
-  }
-  return _poolPromise;
-}
+const {
+  Workspaces, WorkspaceColunas, WorkspaceAcessos, TimeMembros, Tarefas,
+} = require('.');
+const leitura = require('./leituraTarefas');
+const {
+  Op, textoIgual, ordenarPorTexto, distintosSemCaixa,
+} = require('../database/consultas');
 
 const DEFAULT_COLUNAS = [
   { id: null, nome: 'A Fazer',      cor: '#94a3b8', chave: 'A_FAZER'      },
@@ -31,124 +15,108 @@ const DEFAULT_COLUNAS = [
   { id: null, nome: 'Concluído',    cor: '#22c55e', chave: 'CONCLUIDO'    },
 ];
 
+const ATRIBUTOS_WORKSPACE = ['id', 'nome', 'descricao', 'criado_por', 'privado', 'data_criacao', 'ativo'];
+
+async function gruposDoUsuario(username) {
+  const membros = await TimeMembros.findAll({ attributes: ['codigo', 'nome', 'grupo'], where: { ativo: true }, raw: true });
+  return membros
+    .filter(m => textoIgual(m.codigo, username) || textoIgual(m.nome, username))
+    .map(m => m.grupo)
+    .filter(g => g !== null && g !== undefined);
+}
+
+function podeAcessar(workspace, username, acessos, grupos) {
+  if (textoIgual(workspace.criado_por, username)) return true;
+  if (workspace.privado !== false) return false;
+  if (!acessos.length) return true;
+  return acessos.some(a => (textoIgual(a.tipo, 'usuario') && textoIgual(a.codigo, username))
+    || (textoIgual(a.tipo, 'grupo') && grupos.some(g => textoIgual(g, a.codigo))));
+}
+
+async function acessosPorWorkspace(ids) {
+  const mapa = new Map(ids.map(id => [id, []]));
+  if (!ids.length) return mapa;
+  const linhas = await WorkspaceAcessos.findAll({ where: { id_workspace: { [Op.in]: ids } }, order: [['id', 'ASC']], raw: true });
+  for (const linha of linhas) mapa.get(linha.id_workspace).push(linha);
+  return mapa;
+}
+
+function maisRecentesPrimeiro(a, b) {
+  const x = a.data_criacao ? new Date(a.data_criacao).getTime() : null;
+  const y = b.data_criacao ? new Date(b.data_criacao).getTime() : null;
+  if (x === y) return 0;
+  if (x === null) return 1;
+  if (y === null) return -1;
+  return y - x;
+}
+
 async function getAll(username) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('username', sql.VarChar(200), username);
-  const result = await request.query(`
-    SELECT DISTINCT
-      w.id, w.nome, w.descricao, w.criado_por, w.privado, w.data_criacao, w.ativo,
-      (SELECT COUNT(*) FROM TAREFAS t WHERE t.id_workspace = w.id AND t.ativo = 1) AS total_tarefas
-    FROM WORKSPACES w
-    WHERE w.ativo = 1
-      AND (
-        w.criado_por = @username
-        OR (
-          w.privado = 0
-          AND (
-            EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa
-              WHERE wa.id_workspace = w.id
-                AND wa.tipo = 'usuario'
-                AND wa.codigo = @username
-            )
-            OR EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa
-              JOIN TIME_MEMBROS tm ON tm.grupo = wa.codigo
-              WHERE wa.id_workspace = w.id
-                AND wa.tipo = 'grupo'
-                AND (tm.codigo = @username OR tm.nome = @username)
-                AND tm.ativo = 1
-            )
-            OR NOT EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa2
-              WHERE wa2.id_workspace = w.id
-            )
-          )
-        )
-      )
-    ORDER BY w.data_criacao DESC
-  `);
-  return result.recordset;
+  const workspaces = await Workspaces.findAll({ attributes: ATRIBUTOS_WORKSPACE, where: { ativo: true }, order: [['id', 'ASC']], raw: true });
+  const acessos = await acessosPorWorkspace(workspaces.map(w => w.id));
+  const grupos = await gruposDoUsuario(username);
+  const visiveis = workspaces.filter(w => podeAcessar(w, username, acessos.get(w.id), grupos));
+
+  const tarefas = visiveis.length
+    ? await Tarefas.findAll({ attributes: ['id_workspace'], where: { ativo: true, id_workspace: { [Op.in]: visiveis.map(w => w.id) } }, raw: true })
+    : [];
+  return visiveis
+    .map(w => ({ ...w, total_tarefas: tarefas.filter(t => t.id_workspace === w.id).length }))
+    .sort(maisRecentesPrimeiro);
 }
 
 async function getById(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  const result = await request.query(`
-    SELECT w.id, w.nome, w.descricao, w.criado_por, w.privado, w.data_criacao, w.ativo
-    FROM WORKSPACES w
-    WHERE w.id = @id AND w.ativo = 1
-  `);
-  return result.recordset[0] || null;
+  return Workspaces.findOne({ attributes: ATRIBUTOS_WORKSPACE, where: { id, ativo: true }, raw: true });
 }
 
 async function create({ nome, descricao, criado_por, privado }) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('nome',       sql.VarChar(200), nome || '');
-  request.input('descricao',  sql.VarChar(500), descricao || null);
-  request.input('criado_por', sql.VarChar(200), criado_por || '');
-  request.input('privado',    sql.Bit,          privado ? 1 : 0);
-  const result = await request.query(`
-    INSERT INTO WORKSPACES (nome, descricao, criado_por, privado)
-    OUTPUT INSERTED.id
-    VALUES (@nome, @descricao, @criado_por, @privado)
-  `);
-  return result.recordset[0].id;
+  const registro = await Workspaces.create({
+    nome: nome || '',
+    descricao: descricao || null,
+    criado_por: criado_por || '',
+    privado: Boolean(privado),
+  });
+  return registro.id;
 }
 
 async function getColunas(id_workspace) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int, id_workspace);
-  const result = await request.query(`
-    SELECT id, id_workspace, nome, cor, posicao
-    FROM WORKSPACE_COLUNAS
-    WHERE id_workspace = @id_workspace AND ativo = 1
-    ORDER BY posicao ASC
-  `);
-  return result.recordset;
+  const colunas = await WorkspaceColunas.findAll({
+    attributes: ['id', 'id_workspace', 'nome', 'cor', 'posicao'],
+    where: { id_workspace, ativo: true },
+    order: [['id', 'ASC']],
+    raw: true,
+  });
+  return colunas.sort((a, b) => {
+    if (a.posicao === b.posicao) return 0;
+    if (a.posicao === null) return -1;
+    if (b.posicao === null) return 1;
+    return a.posicao - b.posicao;
+  });
 }
 
 async function addColuna(id_workspace, nome, cor, posicao) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int,         id_workspace);
-  request.input('nome',         sql.VarChar(100), nome || '');
-  request.input('cor',          sql.VarChar(20),  cor || '#6366f1');
-  request.input('posicao',      sql.Int,          posicao || 0);
-  const result = await request.query(`
-    INSERT INTO WORKSPACE_COLUNAS (id_workspace, nome, cor, posicao)
-    OUTPUT INSERTED.id
-    VALUES (@id_workspace, @nome, @cor, @posicao)
-  `);
-  return result.recordset[0].id;
+  const registro = await WorkspaceColunas.create({
+    id_workspace,
+    nome: nome || '',
+    cor: cor || '#6366f1',
+    posicao: posicao || 0,
+  });
+  return registro.id;
 }
 
 async function deleteColuna(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`UPDATE WORKSPACE_COLUNAS SET ativo = 0 WHERE id = @id`);
+  await WorkspaceColunas.update({ ativo: false }, { where: { id } });
 }
 
 async function addColunaSmart(id_workspace, nome, cor) {
-  const pool = await getPool();
   let colunas = await getColunas(id_workspace);
   if (colunas.length === 0) {
     for (let i = 0; i < DEFAULT_COLUNAS.length; i++) {
       const def   = DEFAULT_COLUNAS[i];
       const newId = await addColuna(id_workspace, def.nome, def.cor, i);
-      const request = pool.request();
-      request.input('id_workspace', sql.Int,         id_workspace);
-      request.input('status',       sql.VarChar(20), def.chave);
-      request.input('id_coluna',    sql.Int,         newId);
-      await request.query(`
-        UPDATE TAREFAS SET id_coluna = @id_coluna
-        WHERE id_workspace = @id_workspace AND status = @status AND id_coluna IS NULL
-      `);
+      await Tarefas.update(
+        { id_coluna: newId },
+        { where: { id_workspace, status: def.chave, id_coluna: null } }
+      );
     }
     colunas = await getColunas(id_workspace);
   }
@@ -156,183 +124,69 @@ async function addColunaSmart(id_workspace, nome, cor) {
 }
 
 async function reorderColunas(items) {
-  const pool = await getPool();
   for (const item of items) {
-    const request = pool.request();
-    request.input('id', sql.Int, item.id);
-    request.input('posicao', sql.Int, item.posicao);
-    await request.query(`UPDATE WORKSPACE_COLUNAS SET posicao = @posicao WHERE id = @id`);
+    await WorkspaceColunas.update({ posicao: item.posicao }, { where: { id: item.id } });
   }
 }
 
 async function getAcessos(id_workspace) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int, id_workspace);
-  const result = await request.query(`
-    SELECT id, id_workspace, tipo, codigo, nome_display, permissao
-    FROM WORKSPACE_ACESSOS
-    WHERE id_workspace = @id_workspace
-  `);
-  return result.recordset;
+  return WorkspaceAcessos.findAll({
+    attributes: ['id', 'id_workspace', 'tipo', 'codigo', 'nome_display', 'permissao'],
+    where: { id_workspace },
+    order: [['id', 'ASC']],
+    raw: true,
+  });
 }
 
 async function addAcesso(id_workspace, tipo, codigo, nome_display, permissao) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int,         id_workspace);
-  request.input('tipo',         sql.VarChar(50),  tipo);
-  request.input('codigo',       sql.VarChar(200), codigo);
-  request.input('nome_display', sql.VarChar(200), nome_display || null);
-  request.input('permissao',    sql.VarChar(50),  permissao || 'editor');
-  const result = await request.query(`
-    INSERT INTO WORKSPACE_ACESSOS (id_workspace, tipo, codigo, nome_display, permissao)
-    OUTPUT INSERTED.id
-    VALUES (@id_workspace, @tipo, @codigo, @nome_display, @permissao)
-  `);
-  return result.recordset[0].id;
+  const registro = await WorkspaceAcessos.create({
+    id_workspace,
+    tipo,
+    codigo,
+    nome_display: nome_display || null,
+    permissao: permissao || 'editor',
+  });
+  return registro.id;
 }
 
 async function removeAcesso(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`DELETE FROM WORKSPACE_ACESSOS WHERE id = @id`);
+  await WorkspaceAcessos.destroy({ where: { id } });
 }
 
 async function softDelete(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`UPDATE WORKSPACES SET ativo = 0 WHERE id = @id`);
+  await Workspaces.update({ ativo: false }, { where: { id } });
 }
 
 async function hasAccess(id_workspace, username) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int,         id_workspace);
-  request.input('username',     sql.VarChar(200), username);
-  const colsRes = await pool.request().query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'TIME_MEMBROS' AND COLUMN_NAME = 'TIME_ID'");
-  const hasTimeId = colsRes.recordset.length > 0;
-  const sqlText = `
-    SELECT TOP 1 1 AS ok
-    FROM WORKSPACES w
-    WHERE w.id = @id_workspace AND w.ativo = 1
-      AND (
-        w.criado_por = @username
-        OR (
-          w.privado = 0
-          AND (
-            EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa
-              WHERE wa.id_workspace = w.id
-                AND wa.tipo = 'usuario'
-                AND wa.codigo = @username
-            )
-            OR EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa
-              JOIN TIME_MEMBROS tm ON tm.grupo = wa.codigo
-              WHERE wa.id_workspace = w.id
-                AND wa.tipo = 'grupo'
-                AND (tm.codigo = @username OR tm.nome = @username)
-                AND tm.ativo = 1
-            )
-            ${hasTimeId ? `OR EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa
-              JOIN TIME_MEMBROS tm ON tm.time_id = CONVERT(INT, wa.codigo)
-              WHERE wa.id_workspace = w.id
-                AND wa.tipo = 'time'
-                AND (tm.codigo = @username OR tm.nome = @username)
-                AND tm.ativo = 1
-            )` : ''}
-            OR NOT EXISTS (
-              SELECT 1 FROM WORKSPACE_ACESSOS wa2
-              WHERE wa2.id_workspace = w.id
-            )
-          )
-        )
-      )
-  `;
-  const result = await request.query(sqlText);
-  return result.recordset.length > 0;
+  const workspace = await getById(id_workspace);
+  if (!workspace) return false;
+  const acessos = await getAcessos(id_workspace);
+  return podeAcessar(workspace, username, acessos, await gruposDoUsuario(username));
 }
 
 async function getPermissao(id_workspace, username) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int,         id_workspace);
-  request.input('username',     sql.VarChar(200), username);
-  const ownerResult = await request.query(`
-    SELECT criado_por FROM WORKSPACES WHERE id = @id_workspace AND ativo = 1
-  `);
-  if (!ownerResult.recordset[0]) return null;
-  if (ownerResult.recordset[0].criado_por === username) return 'owner';
-  const r2 = pool.request();
-  r2.input('id_workspace', sql.Int,         id_workspace);
-  r2.input('username',     sql.VarChar(200), username);
-  const userAccess = await r2.query(`
-    SELECT permissao FROM WORKSPACE_ACESSOS
-    WHERE id_workspace = @id_workspace AND tipo = 'usuario' AND codigo = @username
-  `);
-  if (userAccess.recordset[0]) return userAccess.recordset[0].permissao;
-  const r3 = pool.request();
-  r3.input('id_workspace', sql.Int,         id_workspace);
-  r3.input('username',     sql.VarChar(200), username);
-  const colsRes = await pool.request().query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'TIME_MEMBROS' AND COLUMN_NAME = 'TIME_ID'");
-  const hasTimeId = colsRes.recordset.length > 0;
-  let sqlText = `
-    SELECT TOP 1 wa.permissao FROM WORKSPACE_ACESSOS wa
-    JOIN TIME_MEMBROS tm ON tm.grupo = wa.codigo
-    WHERE wa.id_workspace = @id_workspace
-      AND wa.tipo = 'grupo'
-      AND (tm.codigo = @username OR tm.nome = @username)
-      AND tm.ativo = 1
-  `;
-  if (hasTimeId) {
-    sqlText += `\nUNION\nSELECT TOP 1 wa.permissao FROM WORKSPACE_ACESSOS wa\nJOIN TIME_MEMBROS tm ON tm.time_id = CONVERT(INT, wa.codigo)\nWHERE wa.id_workspace = @id_workspace\n  AND wa.tipo = 'time'\n  AND (tm.codigo = @username OR tm.nome = @username)\n  AND tm.ativo = 1\n`;
-  }
-  const groupAccess = await r3.query(sqlText);
-  if (groupAccess.recordset[0]) return groupAccess.recordset[0].permissao;
-  const r4 = pool.request();
-  r4.input('id_workspace', sql.Int, id_workspace);
-  const pubCheck = await r4.query(`
-    SELECT w.privado FROM WORKSPACES w WHERE w.id = @id_workspace AND w.ativo = 1
-  `);
-  if (pubCheck.recordset[0] && pubCheck.recordset[0].privado === false) {
+  const workspace = await getById(id_workspace);
+  if (!workspace) return null;
+  if (workspace.criado_por === username) return 'owner';
+  const acessos = await getAcessos(id_workspace);
+  const doUsuario = acessos.find(a => textoIgual(a.tipo, 'usuario') && textoIgual(a.codigo, username));
+  if (doUsuario) return doUsuario.permissao;
+  const grupos = await gruposDoUsuario(username);
+  const doGrupo = acessos.find(a => textoIgual(a.tipo, 'grupo') && grupos.some(g => textoIgual(g, a.codigo)));
+  if (doGrupo) return doGrupo.permissao;
+  if (workspace.privado === false) {
     return 'viewer';
   }
   return null;
 }
 
 async function getKanbanData(id_workspace) {
-  const pool    = await getPool();
   const colunas = await getColunas(id_workspace);
   const hasCustomColunas = colunas.length > 0;
-  const request = pool.request();
-  request.input('id_workspace', sql.Int, id_workspace);
-  const result = await request.query(`
-    SELECT
-      t.id, t.titulo, t.descricao, t.status, t.prioridade,
-      t.data_vencimento, t.posicao, t.data_criacao,
-      t.responsavel_nome, t.id_coluna,
-      LEFT(ISNULL(t.responsavel_nome,'?'), 1) AS avatar_initials,
-      c.nome AS categoria_nome, c.cor AS categoria_cor,
-      wc.nome AS coluna_nome,
-      (SELECT COUNT(*) FROM CHECKLIST_ITEMS ci WHERE ci.id_tarefa = t.id) AS checklist_total,
-      (SELECT COUNT(*) FROM CHECKLIST_ITEMS ci WHERE ci.id_tarefa = t.id AND ci.concluido = 1) AS checklist_done
-    FROM TAREFAS t
-    LEFT JOIN CATEGORIAS c ON c.id = t.id_categoria
-    LEFT JOIN WORKSPACE_COLUNAS wc ON wc.id = t.id_coluna
-    WHERE t.id_workspace = @id_workspace AND t.ativo = 1
-    ORDER BY
-      CASE WHEN ISNULL(t.posicao, 0) < 0 THEN 0 ELSE 1 END ASC,
-      CASE WHEN ISNULL(t.posicao, 0) < 0 THEN t.posicao ELSE 0 END ASC,
-      ISNULL(t.data_vencimento, '9999-12-31') ASC,
-      ISNULL(t.posicao, 2147483647) ASC
-  `);
+  const linhas = await leitura.quadro({ id_workspace }, { comColuna: true });
 
   let colunasResult;
-  let kanban = {};
+  const kanban = {};
 
   if (hasCustomColunas) {
     colunasResult = colunas.map(col => ({
@@ -340,7 +194,7 @@ async function getKanbanData(id_workspace) {
       chave: 'col_' + col.id,
     }));
     colunasResult.forEach(col => { kanban[col.chave] = []; });
-    result.recordset.forEach(row => {
+    linhas.forEach(row => {
       const chave = row.id_coluna ? 'col_' + row.id_coluna : null;
       if (chave && kanban[chave] !== undefined) {
         kanban[chave].push(row);
@@ -351,7 +205,7 @@ async function getKanbanData(id_workspace) {
   } else {
     colunasResult = DEFAULT_COLUNAS.map(c => ({ ...c }));
     DEFAULT_COLUNAS.forEach(col => { kanban[col.chave] = []; });
-    result.recordset.forEach(row => {
+    linhas.forEach(row => {
       if (kanban[row.status] !== undefined) {
         kanban[row.status].push(row);
       } else {
@@ -364,51 +218,22 @@ async function getKanbanData(id_workspace) {
 }
 
 async function getAllTasks(id_workspace) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int, id_workspace);
-  const result = await request.query(`
-    SELECT
-      t.id, t.titulo, t.descricao, t.status, t.prioridade,
-      t.data_vencimento, t.posicao, t.ativo, t.criado_por,
-      t.data_criacao, t.data_atualizacao,
-      t.responsavel_nome, t.id_coluna,
-      LEFT(ISNULL(t.responsavel_nome,'?'), 1) AS avatar_initials,
-      c.nome AS categoria_nome, c.cor AS categoria_cor,
-      wc.nome AS coluna_nome
-    FROM TAREFAS t
-    LEFT JOIN CATEGORIAS c ON c.id = t.id_categoria
-    LEFT JOIN WORKSPACE_COLUNAS wc ON wc.id = t.id_coluna
-    WHERE t.id_workspace = @id_workspace AND t.ativo = 1
-    ORDER BY t.id DESC
-  `);
-  return result.recordset;
+  return leitura.lista({ id_workspace }, { comColuna: true });
 }
 
 async function getStats(id_workspace) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_workspace', sql.Int, id_workspace);
-  const result = await request.query(`
-    SELECT
-      COUNT(*)                                                                                  AS total,
-      SUM(CASE WHEN status = 'CONCLUIDO' THEN 1 ELSE 0 END)                                   AS concluidas,
-      SUM(CASE WHEN status IN ('EM_ANDAMENTO','EM_REVISAO') THEN 1 ELSE 0 END)                AS em_andamento,
-      SUM(CASE WHEN status != 'CONCLUIDO' AND data_vencimento < CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) AS atrasadas
-    FROM TAREFAS
-    WHERE ativo = 1 AND id_workspace = @id_workspace
-  `);
-  return result.recordset[0] || { total: 0, concluidas: 0, em_andamento: 0, atrasadas: 0 };
+  return leitura.estatisticas({ id_workspace });
 }
 
 async function getGrupos() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT DISTINCT grupo FROM TIME_MEMBROS
-    WHERE grupo IS NOT NULL AND ativo = 1
-    ORDER BY grupo
-  `);
-  return result.recordset;
+  const membros = await TimeMembros.findAll({
+    attributes: ['grupo'],
+    where: { grupo: { [Op.ne]: null }, ativo: true },
+    order: [['id', 'ASC']],
+    raw: true,
+  });
+  const grupos = distintosSemCaixa(membros.map(m => m.grupo));
+  return ordenarPorTexto(grupos.map(grupo => ({ grupo })), 'grupo');
 }
 
 module.exports = {

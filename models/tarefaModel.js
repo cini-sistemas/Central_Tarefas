@@ -1,33 +1,12 @@
 'use strict';
 
-const sql      = require('mssql');
-const dbConfig = require('../config/dbConfig');
-let _pool = null;
-let _poolPromise = null;
-
-async function getPool() {
-  if (_pool && _pool.connected) return _pool;
-  if (!_poolPromise) {
-    _poolPromise = (async () => {
-      try {
-        const pool = new sql.ConnectionPool(dbConfig);
-        _pool = await pool.connect();
-        _pool.on('error', () => { _pool = null; _poolPromise = null; });
-        return _pool;
-      } catch (err) {
-        _poolPromise = null;
-        throw err;
-      }
-    })();
-  }
-  return _poolPromise;
-}
-
-function parseDataLocal(str) {
-  if (!str) return null;
-  const [y, m, d] = String(str).split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
+const {
+  Tarefas, Categorias, WorkspaceColunas, ChecklistItems,
+} = require('.');
+const leitura = require('./leituraTarefas');
+const {
+  Op, dataLocal, dataParaGravar, ordenarPorTexto, distintosSemCaixa,
+} = require('../database/consultas');
 
 function truncate(str, max) {
   if (str === undefined || str === null) return null;
@@ -36,305 +15,175 @@ function truncate(str, max) {
 }
 
 async function getKanbanData() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT
-      t.id, t.titulo, t.descricao, t.status, t.prioridade,
-      t.data_vencimento, t.posicao, t.data_criacao,
-      t.responsavel_nome,
-      LEFT(ISNULL(t.responsavel_nome,'?'), 1) AS avatar_initials,
-      c.nome AS categoria_nome, c.cor AS categoria_cor,
-      (SELECT COUNT(*) FROM CHECKLIST_ITEMS ci WHERE ci.id_tarefa = t.id) AS checklist_total,
-      (SELECT COUNT(*) FROM CHECKLIST_ITEMS ci WHERE ci.id_tarefa = t.id AND ci.concluido = 1) AS checklist_done
-    FROM TAREFAS t
-    LEFT JOIN CATEGORIAS c ON c.id = t.id_categoria
-    WHERE t.ativo = 1
-    ORDER BY
-      CASE WHEN ISNULL(t.posicao, 0) < 0 THEN 0 ELSE 1 END ASC,
-      CASE WHEN ISNULL(t.posicao, 0) < 0 THEN t.posicao ELSE 0 END ASC,
-      ISNULL(t.data_vencimento, '9999-12-31') ASC,
-      ISNULL(t.posicao, 2147483647) ASC
-  `);
+  const linhas = await leitura.quadro({}, { comColuna: false });
   const kanban = { A_FAZER: [], EM_ANDAMENTO: [], EM_REVISAO: [], CONCLUIDO: [] };
-  result.recordset.forEach(row => {
+  linhas.forEach(row => {
     if (kanban[row.status]) kanban[row.status].push(row);
   });
   return kanban;
 }
 
 async function getAll() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT
-      t.id, t.titulo, t.descricao, t.status, t.prioridade,
-      t.data_vencimento, t.posicao, t.ativo, t.criado_por,
-      t.data_criacao, t.data_atualizacao,
-      t.responsavel_nome,
-      LEFT(ISNULL(t.responsavel_nome,'?'), 1) AS avatar_initials,
-      c.nome AS categoria_nome, c.cor AS categoria_cor
-    FROM TAREFAS t
-    LEFT JOIN CATEGORIAS c ON c.id = t.id_categoria
-    WHERE t.ativo = 1
-    ORDER BY t.id DESC
-  `);
-  return result.recordset;
+  return leitura.lista({}, { comColuna: false });
 }
 
 async function getStats() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT
-      COUNT(*)                                                                                  AS total,
-      SUM(CASE WHEN status = 'CONCLUIDO' THEN 1 ELSE 0 END)                                   AS concluidas,
-      SUM(CASE WHEN status IN ('EM_ANDAMENTO','EM_REVISAO') THEN 1 ELSE 0 END)                AS em_andamento,
-      SUM(CASE WHEN status != 'CONCLUIDO' AND data_vencimento < CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) AS atrasadas
-    FROM TAREFAS WHERE ativo = 1
-  `);
-  return result.recordset[0] || { total: 0, concluidas: 0, em_andamento: 0, atrasadas: 0 };
+  return leitura.estatisticas({});
 }
 
 async function getChartData() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT
-      SUM(CASE WHEN status = 'A_FAZER'      THEN 1 ELSE 0 END) AS a_fazer,
-      SUM(CASE WHEN status = 'EM_ANDAMENTO' THEN 1 ELSE 0 END) AS em_andamento,
-      SUM(CASE WHEN status = 'EM_REVISAO'   THEN 1 ELSE 0 END) AS em_revisao,
-      SUM(CASE WHEN status = 'CONCLUIDO'    THEN 1 ELSE 0 END) AS concluido,
-      SUM(CASE WHEN prioridade = 'ALTA'     THEN 1 ELSE 0 END) AS alta,
-      SUM(CASE WHEN prioridade = 'MEDIA'    THEN 1 ELSE 0 END) AS media,
-      SUM(CASE WHEN prioridade = 'BAIXA'    THEN 1 ELSE 0 END) AS baixa
-    FROM TAREFAS WHERE ativo = 1
-  `);
-  const row = result.recordset[0] || {};
+  const tarefas = await Tarefas.findAll({ attributes: ['status', 'prioridade'], where: { ativo: true }, raw: true });
+  const conta = (campo, valor) => tarefas.filter(t => String(t[campo] || '').toUpperCase() === valor).length;
   return {
-    porStatus:     [row.a_fazer||0, row.em_andamento||0, row.em_revisao||0, row.concluido||0],
-    porPrioridade: [row.alta||0, row.media||0, row.baixa||0],
+    porStatus:     [conta('status', 'A_FAZER'), conta('status', 'EM_ANDAMENTO'), conta('status', 'EM_REVISAO'), conta('status', 'CONCLUIDO')],
+    porPrioridade: [conta('prioridade', 'ALTA'), conta('prioridade', 'MEDIA'), conta('prioridade', 'BAIXA')],
   };
 }
 
 async function getById(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  const result = await request.query(`
-    SELECT t.*, c.nome AS categoria_nome, wc.nome AS coluna_nome
-    FROM TAREFAS t
-    LEFT JOIN CATEGORIAS c ON c.id = t.id_categoria
-    LEFT JOIN WORKSPACE_COLUNAS wc ON wc.id = t.id_coluna
-    WHERE t.id = @id AND t.ativo = 1
-  `);
-  return result.recordset[0] || null;
+  const tarefa = await Tarefas.findOne({ where: { id, ativo: true }, raw: true });
+  if (!tarefa) return null;
+  const categoria = tarefa.id_categoria ? await Categorias.findOne({ attributes: ['nome'], where: { id: tarefa.id_categoria }, raw: true }) : null;
+  const coluna = tarefa.id_coluna ? await WorkspaceColunas.findOne({ attributes: ['nome'], where: { id: tarefa.id_coluna }, raw: true }) : null;
+  return {
+    ...tarefa,
+    data_vencimento: dataLocal(tarefa.data_vencimento),
+    categoria_nome: categoria ? categoria.nome : null,
+    coluna_nome: coluna ? coluna.nome : null,
+  };
 }
 
-async function getNextPosicao(pool, payload) {
-  const request = pool.request();
-  request.input('id_workspace', sql.Int,         payload.id_workspace || null);
-  request.input('id_coluna',    sql.Int,         payload.id_coluna || null);
-  request.input('status',       sql.VarChar(20), payload.status || 'A_FAZER');
-  const result = await request.query(`
-    SELECT MIN(ISNULL(posicao, 0)) AS minPos
-    FROM TAREFAS
-    WHERE ativo = 1
-      AND ISNULL(id_workspace, 0) = ISNULL(@id_workspace, 0)
-      AND (
-        (@id_coluna IS NOT NULL AND id_coluna = @id_coluna)
-        OR (@id_coluna IS NULL AND id_coluna IS NULL AND status = @status)
-      )
-  `);
-  const minPos = result.recordset[0].minPos;
-  return (minPos === null ? 0 : minPos) - 1;
+async function getNextPosicao(payload) {
+  const idWorkspace = payload.id_workspace || null;
+  const idColuna = payload.id_coluna || null;
+  const filtro = {
+    ativo: true,
+    id_workspace: idWorkspace === null ? { [Op.or]: [null, 0] } : idWorkspace,
+  };
+  if (idColuna !== null) filtro.id_coluna = idColuna;
+  else Object.assign(filtro, { id_coluna: null, status: truncate(payload.status, 20) || 'A_FAZER' });
+  const linhas = await Tarefas.findAll({ attributes: ['posicao'], where: filtro, raw: true });
+  if (!linhas.length) return -1;
+  return Math.min(...linhas.map(l => (l.posicao === null ? 0 : l.posicao))) - 1;
 }
 
 async function insert(payload) {
-  const pool    = await getPool();
   const posicao = (payload.posicao !== undefined && payload.posicao !== null)
     ? payload.posicao
-    : await getNextPosicao(pool, payload);
+    : await getNextPosicao(payload);
 
-  const request = pool.request();
-  request.input('titulo',           sql.VarChar(300), truncate(payload.titulo, 300) || '');
-  request.input('descricao',        sql.Text,         payload.descricao || null);
-  request.input('status',           sql.VarChar(20),  truncate(payload.status, 20) || 'A_FAZER');
-  request.input('prioridade',       sql.VarChar(10),  truncate(payload.prioridade, 10) || 'MEDIA');
-  request.input('responsavel_nome', sql.VarChar(200), truncate(payload.responsavel_nome, 200));
-  request.input('id_categoria',     sql.Int,          payload.id_categoria || null);
-  request.input('data_vencimento',  sql.Date,         parseDataLocal(payload.data_vencimento));
-  request.input('posicao',          sql.Int,          posicao);
-  request.input('criado_por',       sql.VarChar(100), truncate(payload.criado_por, 100));
-  request.input('id_workspace',     sql.Int,          payload.id_workspace || null);
-  request.input('id_coluna',        sql.Int,          payload.id_coluna || null);
-
-  const result = await request.query(`
-    INSERT INTO TAREFAS
-      (titulo, descricao, status, prioridade, responsavel_nome, id_categoria, data_vencimento, posicao, criado_por, id_workspace, id_coluna)
-    OUTPUT INSERTED.id
-    VALUES
-      (@titulo, @descricao, @status, @prioridade, @responsavel_nome, @id_categoria, @data_vencimento, @posicao, @criado_por, @id_workspace, @id_coluna)
-  `);
-  return result.recordset[0].id;
+  const registro = await Tarefas.create({
+    titulo:           truncate(payload.titulo, 300) || '',
+    descricao:        payload.descricao || null,
+    status:           truncate(payload.status, 20) || 'A_FAZER',
+    prioridade:       truncate(payload.prioridade, 10) || 'MEDIA',
+    responsavel_nome: truncate(payload.responsavel_nome, 200),
+    id_categoria:     payload.id_categoria || null,
+    data_vencimento:  dataParaGravar(payload.data_vencimento),
+    posicao,
+    criado_por:       truncate(payload.criado_por, 100),
+    id_workspace:     payload.id_workspace || null,
+    id_coluna:        payload.id_coluna || null,
+  });
+  return registro.id;
 }
 
 async function update(id, payload) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id',               sql.Int,          id);
-  request.input('titulo',           sql.VarChar(300), truncate(payload.titulo, 300) || '');
-  request.input('descricao',        sql.Text,         payload.descricao || null);
-  request.input('status',           sql.VarChar(20),  truncate(payload.status, 20) || 'A_FAZER');
-  request.input('prioridade',       sql.VarChar(10),  truncate(payload.prioridade, 10) || 'MEDIA');
-  request.input('responsavel_nome', sql.VarChar(200), truncate(payload.responsavel_nome, 200));
-  request.input('id_categoria',     sql.Int,          payload.id_categoria || null);
-  request.input('data_vencimento',  sql.Date,         parseDataLocal(payload.data_vencimento));
-  request.input('id_workspace',     sql.Int,          payload.id_workspace !== undefined ? payload.id_workspace : null);
-  request.input('id_coluna',        sql.Int,          payload.id_coluna !== undefined ? payload.id_coluna : null);
-
-  await request.query(`
-    UPDATE TAREFAS SET
-      titulo           = @titulo,
-      descricao        = @descricao,
-      status           = @status,
-      prioridade       = @prioridade,
-      responsavel_nome = @responsavel_nome,
-      id_categoria     = @id_categoria,
-      data_vencimento  = @data_vencimento,
-      id_workspace     = CASE WHEN @id_workspace IS NOT NULL THEN @id_workspace ELSE id_workspace END,
-      id_coluna        = CASE WHEN @id_coluna IS NOT NULL THEN @id_coluna ELSE id_coluna END,
-      data_atualizacao = GETDATE()
-    WHERE id = @id AND ativo = 1
-  `);
+  const campos = {
+    titulo:           truncate(payload.titulo, 300) || '',
+    descricao:        payload.descricao || null,
+    status:           truncate(payload.status, 20) || 'A_FAZER',
+    prioridade:       truncate(payload.prioridade, 10) || 'MEDIA',
+    responsavel_nome: truncate(payload.responsavel_nome, 200),
+    id_categoria:     payload.id_categoria || null,
+    data_vencimento:  dataParaGravar(payload.data_vencimento),
+    data_atualizacao: new Date(),
+  };
+  if (payload.id_workspace !== undefined && payload.id_workspace !== null) campos.id_workspace = payload.id_workspace;
+  if (payload.id_coluna !== undefined && payload.id_coluna !== null) campos.id_coluna = payload.id_coluna;
+  await Tarefas.update(campos, { where: { id, ativo: true } });
 }
 
 async function updateStatus(id, newStatus) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id',     sql.Int,        id);
-  request.input('status', sql.VarChar(20), newStatus);
-  await request.query(`
-    UPDATE TAREFAS SET status = @status, data_atualizacao = GETDATE()
-    WHERE id = @id AND ativo = 1
-  `);
+  await Tarefas.update({ status: newStatus, data_atualizacao: new Date() }, { where: { id, ativo: true } });
 }
 
 async function updatePosicoes(items) {
-  const pool = await getPool();
   for (const item of items) {
-    const request = pool.request();
-    request.input('id',      sql.Int,         item.id);
-    request.input('posicao', sql.Int,         item.posicao);
-    request.input('status',  sql.VarChar(20), item.status || null);
-    await request.query(`
-      UPDATE TAREFAS SET posicao = @posicao, status = @status, data_atualizacao = GETDATE()
-      WHERE id = @id AND ativo = 1
-    `);
+    await Tarefas.update(
+      { posicao: item.posicao, status: item.status || null, data_atualizacao: new Date() },
+      { where: { id: item.id, ativo: true } }
+    );
   }
 }
 
 async function updatePosicoesWorkspace(items) {
-  const pool = await getPool();
   for (const item of items) {
-    const request = pool.request();
-    request.input('id',        sql.Int, item.id);
-    request.input('posicao',   sql.Int, item.posicao);
-    request.input('id_coluna', sql.Int, item.id_coluna || null);
-    await request.query(`
-      UPDATE TAREFAS SET
-        posicao          = @posicao,
-        id_coluna        = ISNULL(@id_coluna, id_coluna),
-        data_atualizacao = GETDATE()
-      WHERE id = @id AND ativo = 1
-    `);
+    const campos = { posicao: item.posicao, data_atualizacao: new Date() };
+    if (item.id_coluna) campos.id_coluna = item.id_coluna;
+    await Tarefas.update(campos, { where: { id: item.id, ativo: true } });
   }
 }
 
 async function deleteById(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`UPDATE TAREFAS SET ativo = 0 WHERE id = @id`);
+  await Tarefas.update({ ativo: false }, { where: { id } });
 }
 
 async function getChecklistItems(tarefaId) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_tarefa', sql.Int, tarefaId);
-  const result = await request.query(`
-    SELECT id, descricao, concluido, posicao
-    FROM CHECKLIST_ITEMS
-    WHERE id_tarefa = @id_tarefa
-    ORDER BY posicao ASC
-  `);
-  return result.recordset;
+  return ChecklistItems.findAll({
+    attributes: ['id', 'descricao', 'concluido', 'posicao'],
+    where: { id_tarefa: tarefaId },
+    order: [['posicao', 'ASC'], ['id', 'ASC']],
+    raw: true,
+  });
 }
 
 async function addChecklistItem(tarefaId, descricao) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_tarefa', sql.Int,         tarefaId);
-  request.input('descricao', sql.VarChar(500), descricao);
-  const result = await request.query(`
-    INSERT INTO CHECKLIST_ITEMS (id_tarefa, descricao, posicao)
-    OUTPUT INSERTED.id
-    VALUES (@id_tarefa, @descricao,
-      (SELECT ISNULL(MAX(posicao),0)+1 FROM CHECKLIST_ITEMS WHERE id_tarefa = @id_tarefa))
-  `);
-  return result.recordset[0].id;
+  const maior = await ChecklistItems.max('posicao', { where: { id_tarefa: tarefaId } });
+  const registro = await ChecklistItems.create({
+    id_tarefa: tarefaId,
+    descricao,
+    posicao: (maior || 0) + 1,
+  });
+  return registro.id;
 }
 
 async function toggleChecklistItem(itemId) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, itemId);
-  const result = await request.query(`
-    UPDATE CHECKLIST_ITEMS SET concluido = 1 - concluido
-    OUTPUT INSERTED.concluido
-    WHERE id = @id
-  `);
-  return result.recordset[0] ? result.recordset[0].concluido : 0;
+  const item = await ChecklistItems.findOne({ attributes: ['concluido'], where: { id: itemId }, raw: true });
+  if (!item) return 0;
+  const concluido = !item.concluido;
+  await ChecklistItems.update({ concluido }, { where: { id: itemId } });
+  return concluido;
 }
 
 async function deleteChecklistItem(itemId) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, itemId);
-  await request.query(`DELETE FROM CHECKLIST_ITEMS WHERE id = @id`);
+  await ChecklistItems.destroy({ where: { id: itemId } });
 }
 
 async function updateChecklistItem(itemId, descricao) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id',        sql.Int,          itemId);
-  request.input('descricao', sql.VarChar(500),  descricao);
-  await request.query(`UPDATE CHECKLIST_ITEMS SET descricao = @descricao WHERE id = @id`);
+  await ChecklistItems.update({ descricao }, { where: { id: itemId } });
 }
 
 async function reorderChecklistItems(items) {
-  const pool = await getPool();
   for (const item of items) {
-    const request = pool.request();
-    request.input('id',      sql.Int, item.id);
-    request.input('posicao', sql.Int, item.posicao);
-    await request.query(`UPDATE CHECKLIST_ITEMS SET posicao = @posicao WHERE id = @id`);
+    await ChecklistItems.update({ posicao: item.posicao }, { where: { id: item.id } });
   }
 }
 
 async function getResponsaveis() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT DISTINCT responsavel_nome AS nome
-    FROM TAREFAS
-    WHERE responsavel_nome IS NOT NULL AND ativo = 1
-    ORDER BY responsavel_nome
-  `);
-  return result.recordset;
+  const linhas = await Tarefas.findAll({
+    attributes: ['responsavel_nome'],
+    where: { responsavel_nome: { [Op.ne]: null }, ativo: true },
+    order: [['id', 'ASC']],
+    raw: true,
+  });
+  const nomes = distintosSemCaixa(linhas.map(l => l.responsavel_nome));
+  return ordenarPorTexto(nomes.map(nome => ({ nome })), 'nome');
 }
 
 async function getCategorias() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT id, nome, cor, icone FROM CATEGORIAS WHERE ativo = 1 ORDER BY nome
-  `);
-  return result.recordset;
+  const linhas = await Categorias.findAll({ attributes: ['id', 'nome', 'cor', 'icone'], where: { ativo: true }, raw: true });
+  return ordenarPorTexto(linhas, 'nome');
 }
 
 module.exports = {

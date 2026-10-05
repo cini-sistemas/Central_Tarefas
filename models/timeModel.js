@@ -1,29 +1,9 @@
 'use strict';
 
 const sql        = require('mssql');
-const dbConfig   = require('../config/dbConfig');
 const dbConfigDw = require('../config/dbConfigDw');
-
-let _pool = null;
-let _poolPromise = null;
-
-async function getPool() {
-  if (_pool && _pool.connected) return _pool;
-  if (!_poolPromise) {
-    _poolPromise = (async () => {
-      try {
-        const pool = new sql.ConnectionPool(dbConfig);
-        _pool = await pool.connect();
-        _pool.on('error', () => { _pool = null; _poolPromise = null; });
-        return _pool;
-      } catch (err) {
-        _poolPromise = null;
-        throw err;
-      }
-    })();
-  }
-  return _poolPromise;
-}
+const { TimeMembros, TimeTimes } = require('.');
+const { ordenarPorTexto } = require('../database/consultas');
 
 async function buscarUsuarios(nome) {
   let pool = null;
@@ -72,123 +52,50 @@ async function buscarUsuarios(nome) {
   }
   }
 
-async function getMembros(timeId) {
-  const pool = await getPool();
-  const colsRes = await pool.request()
-    .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'TIME_MEMBROS'`);
-  const colNames = colsRes.recordset.map(r => r.COLUMN_NAME);
-  const usrIdCol = colNames.find(c => c.toUpperCase() === 'USR_ID');
-  const timeIdCol = colNames.find(c => c.toUpperCase() === 'TIME_ID');
-
-  const selectCols = ['id', 'codigo', 'nome', 'grupo', 'data_cadastro'];
-  if (usrIdCol) selectCols.splice(1, 0, usrIdCol);
-  if (timeIdCol) selectCols.splice((usrIdCol ? 2 : 1), 0, timeIdCol);
-
-  let request = pool.request();
-  let sqlText = `SELECT ${selectCols.join(', ')} FROM TIME_MEMBROS WHERE ativo = 1`;
-  if (timeIdCol && timeId) {
-    request.input('timeId', sql.Int, parseInt(timeId, 10));
-    sqlText += ` AND ${timeIdCol} = @timeId`;
-  }
-  sqlText += ` ORDER BY nome`;
-
-  const result = await request.query(sqlText);
-  const rows = result.recordset.map(r => {
-    if (usrIdCol) r.usr_id = r[usrIdCol];
-    if (timeIdCol) r.time_id = r[timeIdCol];
-    return r;
+async function getMembros() {
+  const linhas = await TimeMembros.findAll({
+    attributes: ['id', 'codigo', 'nome', 'grupo', 'data_cadastro'],
+    where: { ativo: true },
+    order: [['id', 'ASC']],
+    raw: true,
   });
-  return rows;
+  return ordenarPorTexto(linhas, 'nome');
 }
 
 async function addMembro(codigo, nome, grupo) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('codigo', sql.VarChar(200),  codigo || '');
-  request.input('nome',   sql.VarChar(200), nome   || '');
-  request.input('grupo',  sql.VarChar(100), grupo  || null);
-  const colsRes = await pool.request()
-    .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'TIME_MEMBROS'`);
-  const colNames = colsRes.recordset.map(r => r.COLUMN_NAME);
-  const usrIdCol = colNames.find(c => c.toUpperCase() === 'USR_ID');
-  const timeIdCol = colNames.find(c => c.toUpperCase() === 'TIME_ID');
-
-  if (usrIdCol) {
-    request.input('usrId', sql.VarChar(200), arguments[3] || null);
-    if (timeIdCol) {
-      request.input('timeId', sql.Int, arguments[4] || null);
-      const sqlText = `INSERT INTO TIME_MEMBROS (codigo, ${usrIdCol}, ${timeIdCol}, nome, grupo) OUTPUT INSERTED.id VALUES (@codigo, @usrId, @timeId, @nome, @grupo)`;
-      const result = await request.query(sqlText);
-      return result.recordset[0].id;
-    }
-    const sqlText = `INSERT INTO TIME_MEMBROS (codigo, ${usrIdCol}, nome, grupo) OUTPUT INSERTED.id VALUES (@codigo, @usrId, @nome, @grupo)`;
-    const result = await request.query(sqlText);
-    return result.recordset[0].id;
-  }
-  const result = await request.query(`
-    INSERT INTO TIME_MEMBROS (codigo, nome, grupo)
-    OUTPUT INSERTED.id
-    VALUES (@codigo, @nome, @grupo)
-  `);
-  return result.recordset[0].id;
+  const registro = await TimeMembros.create({
+    codigo: codigo || '',
+    nome:   nome   || '',
+    grupo:  grupo  || null,
+  });
+  return registro.id;
 }
 
 async function removeMembro(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`UPDATE TIME_MEMBROS SET ativo = 0 WHERE id = @id`);
+  await TimeMembros.update({ ativo: false }, { where: { id } });
 }
 
 module.exports = { buscarUsuarios, getMembros, addMembro, removeMembro };
 module.exports.getTimes = async function () {
-  const pool = await getPool();
-
-  const colsRes = await pool.request().query(
-    `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'TIME_MEMBROS' AND COLUMN_NAME = 'TIME_ID'`
-  );
-  const hasTimeId = colsRes.recordset.length > 0;
-
-  let sqlText;
-  if (hasTimeId) {
-    sqlText = `
-      SELECT t.id, t.codigo, t.nome, t.descricao, t.criado_em, t.ativo,
-        (SELECT COUNT(*) FROM TIME_MEMBROS m WHERE m.ativo = 1 AND m.TIME_ID = t.id) AS total_membros
-      FROM TIME_TIMES t WHERE t.ativo = 1 ORDER BY t.nome`;
-  } else {
-    sqlText = `
-      SELECT t.id, t.codigo, t.nome, t.descricao, t.criado_em, t.ativo,
-        (SELECT COUNT(*) FROM TIME_MEMBROS m WHERE m.ativo = 1) AS total_membros
-      FROM TIME_TIMES t WHERE t.ativo = 1 ORDER BY t.nome`;
-  }
-
-  const result = await pool.request().query(sqlText);
-  return result.recordset;
+  const times = await TimeTimes.findAll({
+    attributes: ['id', 'codigo', 'nome', 'descricao', 'criado_em', 'ativo'],
+    where: { ativo: true },
+    order: [['id', 'ASC']],
+    raw: true,
+  });
+  const totalMembros = await TimeMembros.count({ where: { ativo: true } });
+  return ordenarPorTexto(times, 'nome').map(t => ({ ...t, total_membros: totalMembros }));
 };
 
 module.exports.addTime = async function (codigo, nome, descricao) {
-  const pool = await getPool();
-  const request = pool.request();
-  request.input('codigo',    sql.VarChar(100), codigo    || null);
-  request.input('nome',      sql.VarChar(200), nome      || null);
-  request.input('descricao', sql.VarChar(500), descricao || null);
-  const result = await request.query(`INSERT INTO TIME_TIMES (codigo, nome, descricao) OUTPUT INSERTED.id VALUES (@codigo, @nome, @descricao)`);
-  return result.recordset[0].id;
+  const registro = await TimeTimes.create({ codigo: codigo || null, nome: nome || null, descricao: descricao || null });
+  return registro.id;
 };
 
 module.exports.updateTime = async function (id, codigo, nome, descricao) {
-  const pool = await getPool();
-  const request = pool.request();
-  request.input('id',        sql.Int,          id);
-  request.input('codigo',    sql.VarChar(100), codigo    || null);
-  request.input('nome',      sql.VarChar(200), nome      || null);
-  request.input('descricao', sql.VarChar(500), descricao || null);
-  await request.query(`UPDATE TIME_TIMES SET codigo = @codigo, nome = @nome, descricao = @descricao WHERE id = @id`);
+  await TimeTimes.update({ codigo: codigo || null, nome: nome || null, descricao: descricao || null }, { where: { id } });
 };
 
 module.exports.deleteTime = async function (id) {
-  const pool = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`UPDATE TIME_TIMES SET ativo = 0 WHERE id = @id`);
+  await TimeTimes.update({ ativo: false }, { where: { id } });
 };

@@ -6,7 +6,10 @@
   "scripts": {
     "start": "title Central de Tarefas && node server.js",
     "test:unit": "node --test tests/unit/*.test.js",
-    "test": "npm run test:unit"
+    "test": "npm run test:unit",
+    "test:integracao": "node --test --test-concurrency=1 tests/integracao/",
+    "db:criar:postgres": "node scripts/executar-sql.js database/sql/postgres/create_tables.sql",
+    "db:migrar:postgres": "node scripts/migrar-para-postgres.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
@@ -17,9 +20,13 @@
     "express": "^4.18.2",
     "express-session": "^1.17.3",
     "mssql": "^12.2.0",
+    "pg": "^8.23.1",
+    "pg-hstore": "^2.3.4",
+    "sequelize": "^6.37.8",
     "swagger-ui-express": "^5.0.1"
   },
   "devDependencies": {
+    "cls-hooked": "^4.2.2",
     "eslint": "^9.39.5",
     "eslint-plugin-security": "^3.0.1"
   }

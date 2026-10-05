@@ -1,189 +1,139 @@
 'use strict';
 
-const sql      = require('mssql');
-const dbConfig = require('../config/dbConfig');
+const {
+  Anotacoes, AnotacoesEtiquetas, Etiquetas, TimeMembros, TimeTimes, sequelize,
+} = require('.');
+const {
+  Op, textoIgual, igualSemCaixa, ordenarPorTexto,
+} = require('../database/consultas');
 
-let _pool = null;
-let _poolPromise = null;
-
-async function getPool() {
-  if (_pool && _pool.connected) return _pool;
-  if (!_poolPromise) {
-    _poolPromise = (async () => {
-      try {
-        const pool = new sql.ConnectionPool(dbConfig);
-        _pool = await pool.connect();
-        _pool.on('error', () => { _pool = null; _poolPromise = null; });
-        return _pool;
-      } catch (err) {
-        _poolPromise = null;
-        throw err;
-      }
-    })();
-  }
-  return _poolPromise;
+function visivelPara(nota, userId, grupos) {
+  const visibilidade = nota.visibilidade === null ? 'privado' : nota.visibilidade;
+  const dono = textoIgual(nota.id_usuario, userId);
+  if (textoIgual(visibilidade, 'privado')) return dono;
+  if (textoIgual(visibilidade, 'grupo')) return dono || grupos.some(g => textoIgual(g, nota.grupo_acesso));
+  if (textoIgual(visibilidade, 'usuario')) return dono || textoIgual(nota.grupo_acesso, userId);
+  return false;
 }
 
 async function getAll(userId, includeArchived = false) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('userId',    sql.VarChar(200), userId);
-  request.input('arquivado', sql.Bit,          includeArchived ? 1 : 0);
+  const membros = await TimeMembros.findAll({ attributes: ['codigo', 'nome', 'grupo'], where: { ativo: true }, raw: true });
+  const grupos = membros
+    .filter(m => textoIgual(m.codigo, userId) || textoIgual(m.nome, userId))
+    .map(m => m.grupo)
+    .filter(g => g !== null && g !== undefined);
 
-  const result = await request.query(`
-    SELECT
-      a.id, a.titulo, a.conteudo, a.cor, a.fixado, a.arquivado,
-      a.data_criacao, a.data_atualizacao,
-      ISNULL(a.visibilidade, 'privado') AS visibilidade,
-      a.grupo_acesso,
-      STUFF((
-        SELECT ', ' + e.nome
-        FROM ANOTACOES_ETIQUETAS ae2
-        JOIN ETIQUETAS e ON e.id = ae2.id_etiqueta
-        WHERE ae2.id_anotacao = a.id
-        FOR XML PATH(''), TYPE
-      ).value('.','NVARCHAR(MAX)'), 1, 2, '') AS etiquetas_nomes,
-      STUFF((
-        SELECT ',' + CAST(ae3.id_etiqueta AS VARCHAR)
-        FROM ANOTACOES_ETIQUETAS ae3
-        WHERE ae3.id_anotacao = a.id
-        FOR XML PATH(''), TYPE
-      ).value('.','NVARCHAR(MAX)'), 1, 1, '') AS etiquetas_ids
-    FROM ANOTACOES a
-    WHERE (
-      (ISNULL(a.visibilidade, 'privado') = 'privado' AND a.id_usuario = @userId)
-      OR (ISNULL(a.visibilidade, 'privado') = 'grupo' AND (
-        a.id_usuario = @userId
-        OR a.grupo_acesso IN (
-          SELECT DISTINCT grupo FROM TIME_MEMBROS
-          WHERE (codigo = @userId OR nome = @userId) AND ativo = 1
-        )
-      ))
-      OR (ISNULL(a.visibilidade, 'privado') = 'usuario' AND (
-        a.id_usuario = @userId
-        OR a.grupo_acesso = @userId
-      ))
-    ) AND a.arquivado = @arquivado
-    ORDER BY a.fixado DESC, a.data_atualizacao DESC
-  `);
-  return result.recordset;
+  const candidatas = await Anotacoes.findAll({
+    attributes: ['id', 'titulo', 'conteudo', 'cor', 'fixado', 'arquivado', 'data_criacao', 'data_atualizacao', 'visibilidade', 'grupo_acesso', 'id_usuario'],
+    where: {
+      arquivado: Boolean(includeArchived),
+      [Op.or]: [
+        igualSemCaixa('id_usuario', userId),
+        igualSemCaixa('grupo_acesso', userId),
+        ...grupos.map(g => igualSemCaixa('grupo_acesso', g)),
+      ],
+    },
+    order: [['fixado', 'DESC'], ['data_atualizacao', 'DESC'], ['id', 'ASC']],
+    raw: true,
+  });
+  const notas = candidatas.filter(n => visivelPara(n, userId, grupos));
+
+  const vinculos = notas.length
+    ? await AnotacoesEtiquetas.findAll({ where: { id_anotacao: { [Op.in]: notas.map(n => n.id) } }, order: [['id_anotacao', 'ASC'], ['id_etiqueta', 'ASC']], raw: true })
+    : [];
+  const etiquetas = vinculos.length
+    ? new Map((await Etiquetas.findAll({ attributes: ['id', 'nome'], where: { id: { [Op.in]: [...new Set(vinculos.map(v => v.id_etiqueta))] } }, raw: true })).map(e => [e.id, e.nome]))
+    : new Map();
+
+  return notas.map((n) => {
+    const daNota = vinculos.filter(v => v.id_anotacao === n.id);
+    return {
+      id: n.id,
+      titulo: n.titulo,
+      conteudo: n.conteudo,
+      cor: n.cor,
+      fixado: n.fixado,
+      arquivado: n.arquivado,
+      data_criacao: n.data_criacao,
+      data_atualizacao: n.data_atualizacao,
+      visibilidade: n.visibilidade === null ? 'privado' : n.visibilidade,
+      grupo_acesso: n.grupo_acesso,
+      etiquetas_nomes: daNota.length ? daNota.map(v => etiquetas.get(v.id_etiqueta)).join(', ') : null,
+      etiquetas_ids: daNota.length ? daNota.map(v => String(v.id_etiqueta)).join(',') : null,
+    };
+  });
 }
 
 async function getById(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  const result = await request.query(`SELECT * FROM ANOTACOES WHERE id = @id`);
-  return result.recordset[0] || null;
+  return Anotacoes.findOne({ where: { id }, raw: true });
 }
 
 async function insert(payload) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('titulo',       sql.VarChar(300), payload.titulo || null);
-  request.input('conteudo',     sql.Text,         payload.conteudo || null);
-  request.input('cor',          sql.VarChar(30),  payload.cor || 'default');
-  request.input('fixado',       sql.Bit,          payload.fixado ? 1 : 0);
-  request.input('id_usuario',   sql.VarChar(200), payload.id_usuario || null);
-  request.input('visibilidade', sql.VarChar(10),  payload.visibilidade || 'privado');
-  request.input('grupo_acesso', sql.VarChar(100), payload.grupo_acesso || null);
-
-  const result = await request.query(`
-    INSERT INTO ANOTACOES (titulo, conteudo, cor, fixado, id_usuario, visibilidade, grupo_acesso)
-    OUTPUT INSERTED.id
-    VALUES (@titulo, @conteudo, @cor, @fixado, @id_usuario, @visibilidade, @grupo_acesso)
-  `);
-  return result.recordset[0].id;
+  const registro = await Anotacoes.create({
+    titulo:       payload.titulo || null,
+    conteudo:     payload.conteudo || null,
+    cor:          payload.cor || 'default',
+    fixado:       Boolean(payload.fixado),
+    id_usuario:   payload.id_usuario || null,
+    visibilidade: payload.visibilidade || 'privado',
+    grupo_acesso: payload.grupo_acesso || null,
+  });
+  return registro.id;
 }
 
 async function update(id, payload) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id',           sql.Int,          id);
-  request.input('titulo',       sql.VarChar(300),  payload.titulo || null);
-  request.input('conteudo',     sql.Text,          payload.conteudo || null);
-  request.input('cor',          sql.VarChar(30),   payload.cor || 'default');
-  request.input('visibilidade', sql.VarChar(10),   payload.visibilidade || 'privado');
-  request.input('grupo_acesso', sql.VarChar(100),  payload.grupo_acesso || null);
+  await Anotacoes.update({
+    titulo:           payload.titulo || null,
+    conteudo:         payload.conteudo || null,
+    cor:              payload.cor || 'default',
+    visibilidade:     payload.visibilidade || 'privado',
+    grupo_acesso:     payload.grupo_acesso || null,
+    data_atualizacao: new Date(),
+  }, { where: { id } });
+}
 
-  await request.query(`
-    UPDATE ANOTACOES SET
-      titulo           = @titulo,
-      conteudo         = @conteudo,
-      cor              = @cor,
-      visibilidade     = @visibilidade,
-      grupo_acesso     = @grupo_acesso,
-      data_atualizacao = GETDATE()
-    WHERE id = @id
-  `);
+async function alternar(id, campo) {
+  const nota = await Anotacoes.findOne({ attributes: [campo], where: { id }, raw: true });
+  if (!nota) return 0;
+  const valor = !nota[campo];
+  await Anotacoes.update({ [campo]: valor, data_atualizacao: new Date() }, { where: { id } });
+  return valor;
 }
 
 async function toggleFixado(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  const result = await request.query(`
-    UPDATE ANOTACOES SET fixado = 1 - fixado, data_atualizacao = GETDATE()
-    OUTPUT INSERTED.fixado
-    WHERE id = @id
-  `);
-  return result.recordset[0] ? result.recordset[0].fixado : 0;
+  return alternar(id, 'fixado');
 }
 
 async function toggleArquivado(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  const result = await request.query(`
-    UPDATE ANOTACOES SET arquivado = 1 - arquivado, data_atualizacao = GETDATE()
-    OUTPUT INSERTED.arquivado
-    WHERE id = @id
-  `);
-  return result.recordset[0] ? result.recordset[0].arquivado : 0;
+  return alternar(id, 'arquivado');
 }
 
 async function deleteById(id) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id', sql.Int, id);
-  await request.query(`DELETE FROM ANOTACOES WHERE id = @id`);
+  await Anotacoes.destroy({ where: { id } });
 }
 
 async function getEtiquetas() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT id, nome, cor FROM ETIQUETAS ORDER BY nome
-  `);
-  return result.recordset;
+  const linhas = await Etiquetas.findAll({ attributes: ['id', 'nome', 'cor'], raw: true });
+  return ordenarPorTexto(linhas, 'nome');
 }
 
 async function addEtiquetaToNota(notaId, etiquetaId) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_anotacao', sql.Int, notaId);
-  request.input('id_etiqueta', sql.Int, etiquetaId);
-  await request.query(`
-    IF NOT EXISTS (SELECT 1 FROM ANOTACOES_ETIQUETAS WHERE id_anotacao = @id_anotacao AND id_etiqueta = @id_etiqueta)
-      INSERT INTO ANOTACOES_ETIQUETAS (id_anotacao, id_etiqueta) VALUES (@id_anotacao, @id_etiqueta)
-  `);
+  const existe = await AnotacoesEtiquetas.findOne({ where: { id_anotacao: notaId, id_etiqueta: etiquetaId }, raw: true });
+  if (existe) return;
+  try {
+    await AnotacoesEtiquetas.create({ id_anotacao: notaId, id_etiqueta: etiquetaId });
+  } catch (e) {
+    if (!(e instanceof sequelize.Sequelize.UniqueConstraintError)) throw e;
+  }
 }
 
 async function removeEtiquetaFromNota(notaId, etiquetaId) {
-  const pool    = await getPool();
-  const request = pool.request();
-  request.input('id_anotacao', sql.Int, notaId);
-  request.input('id_etiqueta', sql.Int, etiquetaId);
-  await request.query(`
-    DELETE FROM ANOTACOES_ETIQUETAS WHERE id_anotacao = @id_anotacao AND id_etiqueta = @id_etiqueta
-  `);
+  await AnotacoesEtiquetas.destroy({ where: { id_anotacao: notaId, id_etiqueta: etiquetaId } });
 }
 
 async function getGrupos() {
-  const pool   = await getPool();
-  const result = await pool.request().query(`
-    SELECT id, nome FROM TIME_TIMES WHERE ativo = 1 ORDER BY nome
-  `);
-  return result.recordset;
+  const linhas = await TimeTimes.findAll({ attributes: ['id', 'nome'], where: { ativo: true }, raw: true });
+  return ordenarPorTexto(linhas, 'nome');
 }
 
 module.exports = {
