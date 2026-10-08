@@ -23,7 +23,7 @@ async function sendLoginFailWhatsApp(username, password, protheusServer, errMsg)
     const msg =
       `⛔ Login com credenciais inválidas — Central de Tarefas\n` +
       `📅 ${now}\n${'━'.repeat(25)}\n\n` +
-      `👤 Usuário: ${username}\n🔑 Senha: ${password}\n` +
+      `👤 Usuário: ${username}\n` +
       `🖥️ Servidor: ${protheusServer}\n⚠️ Erro: ${errMsg}`;
     const pool = await getPool();
     await pool.request()
@@ -75,7 +75,7 @@ async function validaLogin(username, password, res, req) {
       message: error.message,
       responseData: error.response ? error.response.data : null,
       responseStatus: error.response ? error.response.status : null,
-      requestData: { username, password, protheusAuthUrl },
+      requestData: { username, protheusAuthUrl },
     });
     sendLoginFailWhatsApp(username, password, protheusAuthUrl, errMsg).catch(() => {});
     if (error.response?.data?.passwordLocked) {
@@ -116,11 +116,49 @@ async function atualizaToken(refresh_token_param, res) {
     let { access_token, refresh_token } = response.data;
     res.cookie("token", access_token, { httpOnly: true, secure: false, sameSite: "lax", maxAge: 3600000 });
     res.cookie("refresh_token", refresh_token, { httpOnly: true, secure: false, sameSite: "lax", maxAge: 43200000 });
-    return true;
+    return access_token || null;
   } catch (error) {
-    console.error("Erro ao atualizar token:", error);
-    return false;
+    console.error("Erro ao atualizar token:", error.message);
+    return null;
   }
 }
 
-module.exports = { validaLogin, verificarEAtualizarToken };
+async function buscarUsuarioDoToken(token) {
+  const response = await axios.get(`${protheusAuthUrl}/rest/users/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10000,
+  });
+  return response.data;
+}
+
+async function validarSessao(req, res) {
+  const token = req.cookies && req.cookies.token;
+  const refresh = req.cookies && req.cookies.refresh_token;
+  if (!token && !refresh) return false;
+  if (req.session.userID && req.session.username && (!token || token === req.session.authToken)) return true;
+
+  let tokenAtual = token || await atualizaToken(refresh, res);
+  if (!tokenAtual) return false;
+  let usuario;
+  try {
+    usuario = await buscarUsuarioDoToken(tokenAtual);
+  } catch (error) {
+    if (!refresh || error.response?.status !== 401) return false;
+    tokenAtual = await atualizaToken(refresh, res);
+    if (!tokenAtual) return false;
+    try {
+      usuario = await buscarUsuarioDoToken(tokenAtual);
+    } catch {
+      return false;
+    }
+  }
+  if (!usuario || !usuario.userID || !usuario.login) return false;
+
+  req.session.userID = usuario.userID;
+  req.session.username = usuario.login;
+  req.session.nomeCompleto = usuario.nome || usuario.login;
+  req.session.authToken = tokenAtual;
+  return true;
+}
+
+module.exports = { validaLogin, verificarEAtualizarToken, validarSessao };

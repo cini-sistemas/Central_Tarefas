@@ -266,7 +266,7 @@ async function getPermissao(id_workspace, username) {
     SELECT criado_por FROM WORKSPACES WHERE id = @id_workspace AND ativo = 1
   `);
   if (!ownerResult.recordset[0]) return null;
-  if (ownerResult.recordset[0].criado_por === username) return 'owner';
+  if (String(ownerResult.recordset[0].criado_por || '').trim().toLowerCase() === String(username || '').trim().toLowerCase()) return 'owner';
   const r2 = pool.request();
   r2.input('id_workspace', sql.Int,         id_workspace);
   r2.input('username',     sql.VarChar(200), username);
@@ -411,7 +411,40 @@ async function getGrupos() {
   return result.recordset;
 }
 
+async function workspaceDaColuna(idColuna) {
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('id', sql.Int, idColuna);
+  const result = await request.query(`SELECT id_workspace FROM WORKSPACE_COLUNAS WHERE id = @id`);
+  return result.recordset[0] ? result.recordset[0].id_workspace : null;
+}
+
+async function workspaceDoAcesso(idAcesso) {
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('id', sql.Int, idAcesso);
+  const result = await request.query(`SELECT id_workspace FROM WORKSPACE_ACESSOS WHERE id = @id`);
+  return result.recordset[0] ? result.recordset[0].id_workspace : null;
+}
+
+async function idsForaDoWorkspace(tabela, ids, id_workspace) {
+  const lista = [...new Set(ids.map((v) => parseInt(v, 10)))];
+  if (lista.some((v) => !Number.isInteger(v))) return true;
+  if (!lista.length) return false;
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('id_workspace', sql.Int, id_workspace);
+  const params = lista.map((v, i) => { request.input('id' + i, sql.Int, v); return '@id' + i; });
+  const result = await request.query(
+    `SELECT COUNT(*) AS total FROM ${tabela === 'colunas' ? 'WORKSPACE_COLUNAS' : 'TAREFAS'} WHERE id_workspace = @id_workspace AND id IN (${params.join(',')})`
+  );
+  return result.recordset[0].total !== lista.length;
+}
+
 module.exports = {
+  workspaceDaColuna,
+  workspaceDoAcesso,
+  idsForaDoWorkspace,
   getAll,
   getById,
   create,

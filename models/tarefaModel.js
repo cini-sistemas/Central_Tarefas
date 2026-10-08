@@ -337,7 +337,29 @@ async function getCategorias() {
   return result.recordset;
 }
 
+async function tarefaDoChecklist(itemId) {
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('id', sql.Int, itemId);
+  const result = await request.query(`SELECT id_tarefa FROM CHECKLIST_ITEMS WHERE id = @id`);
+  return result.recordset[0] ? result.recordset[0].id_tarefa : null;
+}
+
+async function checklistForaDaTarefa(ids, tarefaId) {
+  const lista = [...new Set(ids.map((v) => parseInt(v, 10)))];
+  if (lista.some((v) => !Number.isInteger(v))) return true;
+  if (!lista.length) return false;
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('tarefaId', sql.Int, tarefaId);
+  const params = lista.map((v, i) => { request.input('id' + i, sql.Int, v); return '@id' + i; });
+  const result = await request.query(`SELECT COUNT(*) AS total FROM CHECKLIST_ITEMS WHERE id_tarefa = @tarefaId AND id IN (${params.join(',')})`);
+  return result.recordset[0].total !== lista.length;
+}
+
 module.exports = {
+  tarefaDoChecklist,
+  checklistForaDaTarefa,
   getKanbanData,
   getAll,
   getStats,

@@ -186,7 +186,30 @@ async function getGrupos() {
   return result.recordset;
 }
 
+async function podeVer(id, userId) {
+  const pool    = await getPool();
+  const request = pool.request();
+  request.input('id',     sql.Int,          id);
+  request.input('userId', sql.VarChar(200), userId);
+  const result = await request.query(`
+    SELECT TOP 1 a.id_usuario
+    FROM ANOTACOES a
+    WHERE a.id = @id AND (
+      a.id_usuario = @userId
+      OR (ISNULL(a.visibilidade, 'privado') = 'grupo' AND a.grupo_acesso IN (
+        SELECT DISTINCT grupo FROM TIME_MEMBROS
+        WHERE (codigo = @userId OR nome = @userId) AND ativo = 1
+      ))
+      OR (ISNULL(a.visibilidade, 'privado') = 'usuario' AND a.grupo_acesso = @userId)
+    )
+  `);
+  if (!result.recordset[0]) return null;
+  const dono = String(result.recordset[0].id_usuario || '').trim().toLowerCase() === String(userId || '').trim().toLowerCase();
+  return { dono };
+}
+
 module.exports = {
+  podeVer,
   getAll,
   getById,
   insert,

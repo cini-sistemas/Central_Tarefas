@@ -58,16 +58,16 @@ app.use((req, res, next) => {
   res.locals.currentPath      = req.path || '/';
   res.locals.currentWorkspace = null;
   res.locals.user = {
-    nome:     req.session.username || req.cookies.username || 'Usuário',
+    nome:     req.session.username || 'Usuário',
     email:    '',
     id:       req.session.userID   || null,
-    initials: (req.session.username || req.cookies.username || 'U').charAt(0).toUpperCase(),
+    initials: (req.session.username || 'U').charAt(0).toUpperCase(),
   };
   next();
 });
 
 function getSessionUser(req) {
-  const nome = req.session.username || req.cookies.username || 'Usuário';
+  const nome = req.session.username || 'Usuário';
   return {
     nome:     nome,
     email:    '',
@@ -76,12 +76,55 @@ function getSessionUser(req) {
   };
 }
 
+const PERMISSOES_EDICAO = ['owner', 'editor'];
+
+function mesmoUsuario(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
+
+function negar(res, status, message) {
+  res.status(status).json({ success: false, message });
+  return false;
+}
+
+async function exigirWorkspace(req, res, wsId, nivel) {
+  if (!Number.isInteger(wsId)) return negar(res, 400, 'Workspace inválido');
+  const username = req.session.username;
+  let permitido;
+  if (nivel === 'ver') {
+    permitido = await workspaceModel.hasAccess(wsId, username);
+  } else {
+    const permissao = await workspaceModel.getPermissao(wsId, username);
+    permitido = nivel === 'dono' ? permissao === 'owner' : PERMISSOES_EDICAO.includes(permissao);
+  }
+  return permitido ? true : negar(res, 403, 'Sem permissão para este workspace');
+}
+
+async function exigirTarefa(req, res, tarefaId, nivel) {
+  const tarefa = Number.isInteger(tarefaId) ? await tarefaModel.getById(tarefaId) : null;
+  if (!tarefa) { negar(res, 404, 'Tarefa não encontrada'); return null; }
+  if (tarefa.id_workspace) return (await exigirWorkspace(req, res, tarefa.id_workspace, nivel)) ? tarefa : null;
+  if (mesmoUsuario(tarefa.criado_por, req.session.username)) return tarefa;
+  negar(res, 403, 'Sem permissão para esta tarefa');
+  return null;
+}
+
+async function exigirColunaDoWorkspace(res, idColuna, wsId) {
+  if (idColuna === undefined || idColuna === null || idColuna === '') return true;
+  const wsColuna = await workspaceModel.workspaceDaColuna(parseInt(idColuna, 10));
+  return wsColuna !== null && wsColuna === wsId ? true : negar(res, 400, 'Coluna inválida para este workspace');
+}
+
 async function ensureAuth(req, res, next) {
-  const token         = req.cookies && req.cookies.token;
-  const refresh_token = req.cookies && req.cookies.refresh_token;
-  if (!token && !refresh_token) {
+  const autenticado = await loginController.validarSessao(req, res).catch(() => false);
+  if (!autenticado) {
+    res.clearCookie('token');
+    res.clearCookie('refresh_token');
+    res.clearCookie('username');
+    if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' });
     return res.redirect('/loginPage');
   }
+  res.locals.user = getSessionUser(req);
   return next();
 }
 
@@ -112,6 +155,9 @@ app.post('/login', async (req, res) => {
 
 app.get('/logout', (req, res) => {
   if (req.session) req.session.destroy(() => {});
+  res.clearCookie('token');
+  res.clearCookie('refresh_token');
+  res.clearCookie('username');
   return res.redirect('/loginPage?logout=true');
 });
 
@@ -129,7 +175,7 @@ app.get('/dashboard', ensureAuth, async (req, res) => {
 app.get('/tarefas/quadro',   ensureAuth, (req, res) => res.redirect('/workspaces'));
 app.get('/tarefas/listagem', ensureAuth, (req, res) => res.redirect('/workspaces'));
 app.get('/workspaces', ensureAuth, async (req, res) => {
-  const username = req.session.username || req.cookies.username || 'Usuário';
+  const username = req.session.username || 'Usuário';
   let workspaces = [];
   try {
     workspaces = await workspaceModel.getAll(username);
@@ -141,7 +187,7 @@ app.get('/workspaces', ensureAuth, async (req, res) => {
 
 app.get('/workspaces/:id/quadro', ensureAuth, async (req, res) => {
   const id       = parseInt(req.params.id, 10);
-  const username = req.session.username || req.cookies.username || 'Usuário';
+  const username = req.session.username || 'Usuário';
   try {
     const workspace = await workspaceModel.getById(id);
     if (!workspace) return res.redirect('/workspaces');
@@ -161,7 +207,7 @@ app.get('/workspaces/:id/quadro', ensureAuth, async (req, res) => {
 
 app.get('/workspaces/:id/listagem', ensureAuth, async (req, res) => {
   const id       = parseInt(req.params.id, 10);
-  const username = req.session.username || req.cookies.username || 'Usuário';
+  const username = req.session.username || 'Usuário';
   try {
     const workspace = await workspaceModel.getById(id);
     if (!workspace) return res.redirect('/workspaces');
@@ -187,7 +233,7 @@ app.get('/workspaces/:id/listagem', ensureAuth, async (req, res) => {
 
 app.post('/api/workspaces', ensureAuth, async (req, res) => {
   try {
-    const username = req.session.username || req.cookies.username || 'Usuário';
+    const username = req.session.username || 'Usuário';
     const { nome, descricao, privado, membros, colunas } = req.body;
     if (!nome || !nome.trim()) return res.status(400).json({ success: false, message: 'Nome é obrigatório' });
     const wsId = await workspaceModel.create({
@@ -235,10 +281,10 @@ app.post('/api/workspaces', ensureAuth, async (req, res) => {
 app.post('/api/workspaces/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id       = parseInt(req.params.id, 10);
-    const username = req.session.username || req.cookies.username || 'Usuário';
+    const username = req.session.username || 'Usuário';
     const ws = await workspaceModel.getById(id);
     if (!ws) return res.status(404).json({ success: false, message: 'Workspace não encontrado' });
-    if (ws.criado_por !== username) return res.status(403).json({ success: false, message: 'Sem permissão' });
+    if (!mesmoUsuario(ws.criado_por, username)) return res.status(403).json({ success: false, message: 'Sem permissão' });
     await workspaceModel.softDelete(id);
     return res.json({ success: true });
   } catch (e) {
@@ -249,7 +295,9 @@ app.post('/api/workspaces/:id/delete', ensureAuth, async (req, res) => {
 app.post('/api/workspaces/:wsId/tarefas', ensureAuth, async (req, res) => {
   try {
     const wsId    = parseInt(req.params.wsId, 10);
-    const username = req.session.username || req.cookies.username || 'Usuário';
+    const username = req.session.username || 'Usuário';
+    if (!(await exigirWorkspace(req, res, wsId, 'editar'))) return;
+    if (!(await exigirColunaDoWorkspace(res, req.body.id_coluna, wsId))) return;
     const payload  = Object.assign({}, req.body, {
       criado_por:   username,
       id_workspace: wsId,
@@ -266,6 +314,15 @@ app.post('/api/workspaces/:wsId/tarefas/reorder', ensureAuth, async (req, res) =
   try {
     const { cards } = req.body;
     if (!Array.isArray(cards)) return res.status(400).json({ success: false, message: 'cards inválido' });
+    const wsId = parseInt(req.params.wsId, 10);
+    if (!(await exigirWorkspace(req, res, wsId, 'editar'))) return;
+    if (await workspaceModel.idsForaDoWorkspace('tarefas', cards.map(c => c && c.id), wsId)) {
+      return res.status(400).json({ success: false, message: 'Tarefas inválidas para este workspace' });
+    }
+    const colunasCards = cards.map(c => c && c.id_coluna).filter(v => v !== undefined && v !== null && v !== '');
+    if (await workspaceModel.idsForaDoWorkspace('colunas', colunasCards, wsId)) {
+      return res.status(400).json({ success: false, message: 'Colunas inválidas para este workspace' });
+    }
     const hasColuna = cards.length > 0 && cards[0].id_coluna !== undefined;
     if (hasColuna) {
       await tarefaModel.updatePosicoesWorkspace(cards);
@@ -284,6 +341,7 @@ app.post('/api/workspaces/:id/colunas', ensureAuth, async (req, res) => {
     const id  = parseInt(req.params.id, 10);
     const { nome, cor } = req.body;
     if (!nome || !nome.trim()) return res.status(400).json({ success: false, message: 'Nome é obrigatório' });
+    if (!(await exigirWorkspace(req, res, id, 'editar'))) return;
     const colId = await workspaceModel.addColunaSmart(id, nome.trim(), cor || '#6366f1');
     return res.json({ success: true, id: colId });
   } catch (e) {
@@ -295,6 +353,11 @@ app.post('/api/workspaces/:id/colunas/reorder', ensureAuth, async (req, res) => 
   try {
     const { items } = req.body;
     if (!Array.isArray(items)) return res.status(400).json({ success: false, message: 'items inválido' });
+    const wsId = parseInt(req.params.id, 10);
+    if (!(await exigirWorkspace(req, res, wsId, 'editar'))) return;
+    if (await workspaceModel.idsForaDoWorkspace('colunas', items.map(i => i && i.id), wsId)) {
+      return res.status(400).json({ success: false, message: 'Colunas inválidas para este workspace' });
+    }
     await workspaceModel.reorderColunas(items);
     return res.json({ success: true });
   } catch (e) {
@@ -305,6 +368,9 @@ app.post('/api/workspaces/:id/colunas/reorder', ensureAuth, async (req, res) => 
 app.post('/api/workspaces/colunas/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    const wsId = await workspaceModel.workspaceDaColuna(id);
+    if (!wsId) return res.status(404).json({ success: false, message: 'Coluna não encontrada' });
+    if (!(await exigirWorkspace(req, res, wsId, 'editar'))) return;
     await workspaceModel.deleteColuna(id);
     return res.json({ success: true });
   } catch (e) {
@@ -315,6 +381,7 @@ app.post('/api/workspaces/colunas/:id/delete', ensureAuth, async (req, res) => {
 app.post('/api/workspaces/:id/acessos', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (!(await exigirWorkspace(req, res, id, 'dono'))) return;
     let { tipo, codigo, nome_display, permissao } = req.body;
     if (tipo === 'grupo' && codigo) {
       try {
@@ -340,6 +407,9 @@ app.post('/api/workspaces/:id/acessos', ensureAuth, async (req, res) => {
 app.post('/api/workspaces/acessos/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    const wsId = await workspaceModel.workspaceDoAcesso(id);
+    if (!wsId) return res.status(404).json({ success: false, message: 'Acesso não encontrado' });
+    if (!(await exigirWorkspace(req, res, wsId, 'dono'))) return;
     await workspaceModel.removeAcesso(id);
     return res.json({ success: true });
   } catch (e) {
@@ -348,7 +418,7 @@ app.post('/api/workspaces/acessos/:id/delete', ensureAuth, async (req, res) => {
 });
 
 app.get('/anotacoes', ensureAuth, async (req, res) => {
-  const userId         = req.session.username || req.cookies.username || '';
+  const userId         = req.session.username || '';
   const includeArchived = req.query.arquivadas === '1';
   let anotacoes = [];
   let etiquetas = [];
@@ -365,7 +435,7 @@ app.get('/anotacoes', ensureAuth, async (req, res) => {
 
 app.get('/api/tarefas', ensureAuth, async (req, res) => {
   try {
-    const data = await tarefaModel.getAll();
+    const data = (await tarefaModel.getAll()).filter(t => mesmoUsuario(t.criado_por, req.session.username));
     return res.json({ success: true, data });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
@@ -375,7 +445,8 @@ app.get('/api/tarefas', ensureAuth, async (req, res) => {
 app.get('/api/tarefas/:id', ensureAuth, async (req, res) => {
   try {
     const id   = parseInt(req.params.id, 10);
-    const data = await tarefaModel.getById(id);
+    const data = await exigirTarefa(req, res, id, 'ver');
+    if (!data) return;
     return res.json({ success: true, data });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
@@ -384,6 +455,13 @@ app.get('/api/tarefas/:id', ensureAuth, async (req, res) => {
 
 app.post('/api/tarefas', ensureAuth, async (req, res) => {
   try {
+    const wsDestino = req.body.id_workspace ? parseInt(req.body.id_workspace, 10) : null;
+    if (wsDestino !== null) {
+      if (!(await exigirWorkspace(req, res, wsDestino, 'editar'))) return;
+      if (!(await exigirColunaDoWorkspace(res, req.body.id_coluna, wsDestino))) return;
+    } else if (req.body.id_coluna) {
+      return res.status(400).json({ success: false, message: 'Coluna inválida' });
+    }
     const payload = Object.assign({}, req.body, { criado_por: getSessionUser(req).nome });
     const id = await tarefaModel.insert(payload);
     return res.json({ success: true, id });
@@ -397,6 +475,9 @@ app.post('/api/tarefas/reorder', ensureAuth, async (req, res) => {
   try {
     const { cards } = req.body;
     if (!Array.isArray(cards)) return res.status(400).json({ success: false, message: 'cards inválido' });
+    for (const card of cards) {
+      if (!(await exigirTarefa(req, res, parseInt(card && card.id, 10), 'editar'))) return;
+    }
     await tarefaModel.updatePosicoes(cards);
     return res.json({ success: true });
   } catch (e) {
@@ -408,6 +489,16 @@ app.post('/api/tarefas/reorder', ensureAuth, async (req, res) => {
 app.post('/api/tarefas/:id/update', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    const tarefa = await exigirTarefa(req, res, id, 'editar');
+    if (!tarefa) return;
+    const wsDestino = req.body.id_workspace !== undefined && req.body.id_workspace !== null && req.body.id_workspace !== ''
+      ? parseInt(req.body.id_workspace, 10) : tarefa.id_workspace;
+    if (wsDestino !== tarefa.id_workspace && !(await exigirWorkspace(req, res, wsDestino, 'editar'))) return;
+    if (wsDestino) {
+      if (!(await exigirColunaDoWorkspace(res, req.body.id_coluna, wsDestino))) return;
+    } else if (req.body.id_coluna) {
+      return res.status(400).json({ success: false, message: 'Coluna inválida' });
+    }
     await tarefaModel.update(id, req.body);
     return res.json({ success: true });
   } catch (e) {
@@ -418,6 +509,7 @@ app.post('/api/tarefas/:id/update', ensureAuth, async (req, res) => {
 app.post('/api/tarefas/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, id, 'editar'))) return;
     await tarefaModel.deleteById(id);
     return res.json({ success: true });
   } catch (e) {
@@ -428,6 +520,7 @@ app.post('/api/tarefas/:id/delete', ensureAuth, async (req, res) => {
 app.post('/api/tarefas/:id/status', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, id, 'editar'))) return;
     await tarefaModel.updateStatus(id, req.body.status);
     return res.json({ success: true });
   } catch (e) {
@@ -438,6 +531,7 @@ app.post('/api/tarefas/:id/status', ensureAuth, async (req, res) => {
 app.get('/api/tarefas/:id/checklist', ensureAuth, async (req, res) => {
   try {
     const id   = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, id, 'ver'))) return;
     const data = await tarefaModel.getChecklistItems(id);
     return res.json({ success: true, data });
   } catch (e) {
@@ -448,6 +542,7 @@ app.get('/api/tarefas/:id/checklist', ensureAuth, async (req, res) => {
 app.post('/api/tarefas/:id/checklist', ensureAuth, async (req, res) => {
   try {
     const id  = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, id, 'editar'))) return;
     const newId = await tarefaModel.addChecklistItem(id, req.body.descricao);
     return res.json({ success: true, id: newId });
   } catch (e) {
@@ -458,6 +553,7 @@ app.post('/api/tarefas/:id/checklist', ensureAuth, async (req, res) => {
 app.post('/api/checklist/:id/toggle', ensureAuth, async (req, res) => {
   try {
     const id       = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, await tarefaModel.tarefaDoChecklist(id), 'editar'))) return;
     const concluido = await tarefaModel.toggleChecklistItem(id);
     return res.json({ success: true, concluido });
   } catch (e) {
@@ -468,6 +564,7 @@ app.post('/api/checklist/:id/toggle', ensureAuth, async (req, res) => {
 app.post('/api/checklist/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, await tarefaModel.tarefaDoChecklist(id), 'editar'))) return;
     await tarefaModel.deleteChecklistItem(id);
     return res.json({ success: true });
   } catch (e) {
@@ -480,6 +577,7 @@ app.post('/api/checklist/:id/update', ensureAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { descricao } = req.body;
     if (!descricao || !descricao.trim()) return res.status(400).json({ success: false, message: 'Descrição obrigatória' });
+    if (!(await exigirTarefa(req, res, await tarefaModel.tarefaDoChecklist(id), 'editar'))) return;
     await tarefaModel.updateChecklistItem(id, descricao.trim());
     return res.json({ success: true });
   } catch (e) {
@@ -491,6 +589,11 @@ app.post('/api/tarefas/:id/checklist/reorder', ensureAuth, async (req, res) => {
   try {
     const { items } = req.body;
     if (!Array.isArray(items)) return res.status(400).json({ success: false, message: 'items inválido' });
+    const tarefaId = parseInt(req.params.id, 10);
+    if (!(await exigirTarefa(req, res, tarefaId, 'editar'))) return;
+    if (await tarefaModel.checklistForaDaTarefa(items.map(i => i && i.id), tarefaId)) {
+      return res.status(400).json({ success: false, message: 'Itens inválidos para esta tarefa' });
+    }
     await tarefaModel.reorderChecklistItems(items);
     return res.json({ success: true });
   } catch (e) {
@@ -510,6 +613,7 @@ app.get('/api/anotacoes/grupos', ensureAuth, async (req, res) => {
 app.get('/api/anotacoes/:id', ensureAuth, async (req, res) => {
   try {
     const id   = parseInt(req.params.id, 10);
+    if (!(await anotacaoModel.podeVer(id, req.session.username))) return res.status(404).json({ success: false, message: 'Anotação não encontrada' });
     const data = await anotacaoModel.getById(id);
     return res.json({ success: true, data });
   } catch (e) {
@@ -519,7 +623,7 @@ app.get('/api/anotacoes/:id', ensureAuth, async (req, res) => {
 
 app.post('/api/anotacoes', ensureAuth, async (req, res) => {
   try {
-    const payload = Object.assign({}, req.body, { id_usuario: req.session.username || req.cookies.username || null });
+    const payload = Object.assign({}, req.body, { id_usuario: req.session.username || null });
     console.log('Payload anotacao:', payload);
     const id = await anotacaoModel.insert(payload);
     return res.json({ success: true, id });
@@ -532,6 +636,7 @@ app.post('/api/anotacoes', ensureAuth, async (req, res) => {
 app.post('/api/anotacoes/:id/update', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (!(await anotacaoModel.podeVer(id, req.session.username))) return res.status(404).json({ success: false, message: 'Anotação não encontrada' });
     await anotacaoModel.update(id, req.body);
     return res.json({ success: true });
   } catch (e) {
@@ -542,6 +647,9 @@ app.post('/api/anotacoes/:id/update', ensureAuth, async (req, res) => {
 app.post('/api/anotacoes/:id/delete', ensureAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    const acesso = await anotacaoModel.podeVer(id, req.session.username);
+    if (!acesso) return res.status(404).json({ success: false, message: 'Anotação não encontrada' });
+    if (!acesso.dono) return res.status(403).json({ success: false, message: 'Somente o autor pode excluir a anotação' });
     await anotacaoModel.deleteById(id);
     return res.json({ success: true });
   } catch (e) {
@@ -552,6 +660,7 @@ app.post('/api/anotacoes/:id/delete', ensureAuth, async (req, res) => {
 app.post('/api/anotacoes/:id/pin', ensureAuth, async (req, res) => {
   try {
     const id     = parseInt(req.params.id, 10);
+    if (!(await anotacaoModel.podeVer(id, req.session.username))) return res.status(404).json({ success: false, message: 'Anotação não encontrada' });
     const fixado = await anotacaoModel.toggleFixado(id);
     return res.json({ success: true, fixado });
   } catch (e) {
@@ -562,6 +671,7 @@ app.post('/api/anotacoes/:id/pin', ensureAuth, async (req, res) => {
 app.post('/api/anotacoes/:id/archive', ensureAuth, async (req, res) => {
   try {
     const id       = parseInt(req.params.id, 10);
+    if (!(await anotacaoModel.podeVer(id, req.session.username))) return res.status(404).json({ success: false, message: 'Anotação não encontrada' });
     const arquivado = await anotacaoModel.toggleArquivado(id);
     return res.json({ success: true, arquivado });
   } catch (e) {
