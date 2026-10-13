@@ -64,7 +64,7 @@ O sistema resolve a necessidade de:
 - **Tipo:** SQL Server (biblioteca `mssql`)
 - **Bancos:**
   - `dw` — Data Warehouse (tarefas, anotações, workspaces, times)
-  - `p11_prod` — Protheus ERP (dados auxiliares de usuários)
+  - `p2510` — Protheus ERP (dados auxiliares de usuários)
 
 ## 🔗 Integrações
 
@@ -86,7 +86,7 @@ DB_USER_CT=seu_usuario
 DB_PASSWORD_CT=sua_senha
 DB_SERVER_CT=localhost
 DB_DATABASE_DW=dw
-DB_DATABASE_PROTHEUS=p11_prod
+DB_DATABASE_PROTHEUS=p2510
 
 # Segurança
 JWT_SECRET_CT=sua_chave_secreta
@@ -110,7 +110,7 @@ http://localhost:3002/docs
 
 ### Pré-requisitos
 - Node.js instalado
-- SQL Server com os bancos `dw` e `p11_prod` acessíveis
+- SQL Server com os bancos `dw` e `p2510` acessíveis
 - PM2 (opcional, para produção)
 
 ### Instalação
