@@ -13,6 +13,8 @@ const anotacaoModel    = require('./models/anotacaoModel');
 const timeModel        = require('./models/timeModel');
 const workspaceModel   = require('./models/workspaceModel');
 const app  = express();
+const f2b = require('./security/cini-fail2ban');
+app.use(f2b.guard('central-tarefas', {loginPaths: ['/login']}));
 const PORT = process.env.PORT || 3002;
 
 app.use(compression());
@@ -44,7 +46,7 @@ app.use((req, res, next) => {
   return next();
 });
 app.use(session({
-  secret:            process.env.SESSION_SECRET || 'central_tarefas_secret_change_me',
+  secret:            process.env.SESSION_SECRET || require('crypto').randomBytes(48).toString('hex'),
   resave:            false,
   saveUninitialized: false,
   cookie:            { maxAge: 8 * 60 * 60 * 1000 },
